@@ -1,9 +1,9 @@
 import hashlib
 from collections import deque
 import networkx as nx
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib import gridspec
+# import matplotlib.pyplot as plt
+# import matplotlib.colors as mcolors
+# from matplotlib import gridspec
 import numpy as np
 from lark import Lark, Transformer
 from rdcanon.askcos_prims import prims as prims1
@@ -1856,115 +1856,115 @@ def order_token_canon(
     return "[" + dg.nodes[0]["text"] + "]", weights_in_order[-1], dg
 
 
-def generate(
-    test_smarts="[!a@H&D2;#7,#6;H;a-3;#7,!O,!#8&!O;#7,!O,!#8&!O++;*;H0]",
-    title="figures/heatmaps/network.png",
-    figsize=(3.6, 2),
-):
-    sanitized, group_smarts = sanitize_smarts_token(test_smarts)
-    hmps, opss, x_tokss, dgs, titles = gen_data_structure(
-        sanitized, group_smarts, test_smarts
-    )
+# def generate(
+#     test_smarts="[!a@H&D2;#7,#6;H;a-3;#7,!O,!#8&!O;#7,!O,!#8&!O++;*;H0]",
+#     title="figures/heatmaps/network.png",
+#     figsize=(3.6, 2),
+# ):
+#     sanitized, group_smarts = sanitize_smarts_token(test_smarts)
+#     hmps, opss, x_tokss, dgs, titles = gen_data_structure(
+#         sanitized, group_smarts, test_smarts
+#     )
 
-    fig = plt.figure(figsize=(3.5, 4), dpi=300)
-    gs = gridspec.GridSpec(
-        1,
-        len(hmps),
-        width_ratios=[len(hmps[i].T) + len(opss[i]) for i in range(len(hmps))],
-        wspace=0.0,
-        hspace=0.0,
-        top=0.9,
-        bottom=0.1,
-        left=0.1,
-        right=0.9,
-    )
+#     fig = plt.figure(figsize=(3.5, 4), dpi=300)
+#     gs = gridspec.GridSpec(
+#         1,
+#         len(hmps),
+#         width_ratios=[len(hmps[i].T) + len(opss[i]) for i in range(len(hmps))],
+#         wspace=0.0,
+#         hspace=0.0,
+#         top=0.9,
+#         bottom=0.1,
+#         left=0.1,
+#         right=0.9,
+#     )
 
-    ylim = 24
-    for i, axs in enumerate(gs):
-        axs = plt.subplot(gs[i])
-        cmap = mcolors.ListedColormap(["black", "darkgrey", "lightgrey", "#f7ae1d"])
-        bounds = [-15, -10, -6, -1, 0]
-        norm = mcolors.BoundaryNorm(bounds, cmap.N)
-        hm = hmps[i].T
-        hm = hm[:, :ylim]
-        ops = opss[i][: len(opss[i]) - 1]
-        hm2 = []
-        ops2 = []
-        for iix, ii in enumerate(hm):
-            hm2.append(ii)
-            ops2.append("")
-            if iix < len(ops):
-                if ops[iix] == "or (,)":
-                    val = -5
-                elif ops[iix] == "and (&)":
-                    val = -10
-                hm2.append([val] * len(ii))
-                ops2.append(ops[iix])
+#     ylim = 24
+#     for i, axs in enumerate(gs):
+#         axs = plt.subplot(gs[i])
+#         cmap = mcolors.ListedColormap(["black", "darkgrey", "lightgrey", "#f7ae1d"])
+#         bounds = [-15, -10, -6, -1, 0]
+#         norm = mcolors.BoundaryNorm(bounds, cmap.N)
+#         hm = hmps[i].T
+#         hm = hm[:, :ylim]
+#         ops = opss[i][: len(opss[i]) - 1]
+#         hm2 = []
+#         ops2 = []
+#         for iix, ii in enumerate(hm):
+#             hm2.append(ii)
+#             ops2.append("")
+#             if iix < len(ops):
+#                 if ops[iix] == "or (,)":
+#                     val = -5
+#                 elif ops[iix] == "and (&)":
+#                     val = -10
+#                 hm2.append([val] * len(ii))
+#                 ops2.append(ops[iix])
 
-        if i < len(hmps) - 1:
-            hm2.append([-20] * len(hm[0]))
-            ops2.append("and (;)")
-        hm2 = np.array(hm2).T
-        x_toks = list(x_tokss[i])[:ylim]
-        if i == 0:
-            axs.set_yticks(range(len(x_toks)), x_toks)
-            axs.set_yticklabels(x_toks, fontsize=6, fontfamily="arial")
-        else:
-            axs.set_yticks([])
-        axs.set_xticks(range(len(ops2)), ops2, rotation=90)
-        axs.set_xticklabels(ops2, fontsize=6, rotation=90, fontfamily="arial")
-        masked_array = np.ma.array(hm2, mask=np.isnan(hm2))
-        # cmap = matplotlib.cm.plasma
-        cmap.set_bad("beige", 1.0)
-        axs.imshow(hm2, cmap=cmap, norm=norm)
-        for idx1, ii in enumerate(hm2):
-            for idx2, jj in enumerate(ii):
-                if not np.isnan(jj) and jj > -1:
-                    axs.text(
-                        idx2,
-                        idx1,
-                        str(int(jj)),
-                        ha="center",
-                        va="center",
-                        color="black",
-                        fontsize=6,
-                        fontfamily="arial",
-                    )
-        for i22 in range(hm2.shape[0]):
-            axs.axhline(i22 - 0.5, color="black", linewidth=0.8)
-        # axs.set_title(titles[i], fontsize=6, fontfamily='arial')
-        axs.set_aspect("auto")
+#         if i < len(hmps) - 1:
+#             hm2.append([-20] * len(hm[0]))
+#             ops2.append("and (;)")
+#         hm2 = np.array(hm2).T
+#         x_toks = list(x_tokss[i])[:ylim]
+#         if i == 0:
+#             axs.set_yticks(range(len(x_toks)), x_toks)
+#             axs.set_yticklabels(x_toks, fontsize=6, fontfamily="arial")
+#         else:
+#             axs.set_yticks([])
+#         axs.set_xticks(range(len(ops2)), ops2, rotation=90)
+#         axs.set_xticklabels(ops2, fontsize=6, rotation=90, fontfamily="arial")
+#         masked_array = np.ma.array(hm2, mask=np.isnan(hm2))
+#         # cmap = matplotlib.cm.plasma
+#         cmap.set_bad("beige", 1.0)
+#         axs.imshow(hm2, cmap=cmap, norm=norm)
+#         for idx1, ii in enumerate(hm2):
+#             for idx2, jj in enumerate(ii):
+#                 if not np.isnan(jj) and jj > -1:
+#                     axs.text(
+#                         idx2,
+#                         idx1,
+#                         str(int(jj)),
+#                         ha="center",
+#                         va="center",
+#                         color="black",
+#                         fontsize=6,
+#                         fontfamily="arial",
+#                     )
+#         for i22 in range(hm2.shape[0]):
+#             axs.axhline(i22 - 0.5, color="black", linewidth=0.8)
+#         # axs.set_title(titles[i], fontsize=6, fontfamily='arial')
+#         axs.set_aspect("auto")
 
-    plt.suptitle(test_smarts, fontsize=6, fontfamily="arial")
-    plt.show()
-    # plt.savefig(title+"-heatmap.png", dpi=300, bbox_inches='tight', pad_inches=0.01)
+#     plt.suptitle(test_smarts, fontsize=6, fontfamily="arial")
+#     plt.show()
+#     # plt.savefig(title+"-heatmap.png", dpi=300, bbox_inches='tight', pad_inches=0.01)
 
-    plt.close()
+#     plt.close()
 
-    labels2 = {}
-    node_list_tokens = []
-    node_list_junctions = []
-    for n in dgs.nodes():
-        labels2[n] = dgs.nodes[n]["label"]
-        if labels2[n] not in [";", ",", "&"]:
-            node_list_tokens.append(n)
-        else:
-            node_list_junctions.append(n)
+#     labels2 = {}
+#     node_list_tokens = []
+#     node_list_junctions = []
+#     for n in dgs.nodes():
+#         labels2[n] = dgs.nodes[n]["label"]
+#         if labels2[n] not in [";", ",", "&"]:
+#             node_list_tokens.append(n)
+#         else:
+#             node_list_junctions.append(n)
 
-    plt.figure(figsize=figsize, dpi=300)
+#     plt.figure(figsize=figsize, dpi=300)
 
-    pos = nx.nx_agraph.graphviz_layout(dgs, prog="dot")
-    nx.draw_networkx_nodes(
-        dgs, pos, nodelist=node_list_tokens, node_size=125, node_color="#f7ae1d"
-    )
-    nx.draw_networkx_nodes(
-        dgs, pos, nodelist=node_list_junctions, node_size=50, node_color="grey"
-    )
-    nx.draw_networkx_labels(
-        dgs, pos, labels2, font_size=6, font_family="arial", font_color="black"
-    )
-    nx.draw_networkx_edges(dgs, pos)
+#     pos = nx.nx_agraph.graphviz_layout(dgs, prog="dot")
+#     nx.draw_networkx_nodes(
+#         dgs, pos, nodelist=node_list_tokens, node_size=125, node_color="#f7ae1d"
+#     )
+#     nx.draw_networkx_nodes(
+#         dgs, pos, nodelist=node_list_junctions, node_size=50, node_color="grey"
+#     )
+#     nx.draw_networkx_labels(
+#         dgs, pos, labels2, font_size=6, font_family="arial", font_color="black"
+#     )
+#     nx.draw_networkx_edges(dgs, pos)
 
-    # plt.savefig(title + "-tree.png", dpi=300, bbox_inches="tight", pad_inches=0.01)
+#     # plt.savefig(title + "-tree.png", dpi=300, bbox_inches="tight", pad_inches=0.01)
 
-    plt.show()
+#     plt.show()

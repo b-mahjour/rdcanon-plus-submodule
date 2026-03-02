@@ -1,6 +1,6 @@
 from rdcanon.main import canon_smarts, canon_reaction_smarts, random_smarts
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import rdChemReactions
 import timeit
 import time
 from matplotlib import pyplot as plt
@@ -50,8 +50,8 @@ def compare_reaction_outputs(reactant_objs_in, template_list, canon_template_lis
 
 def compare_products(reaction_template, reactants_in):
     canon_rxn1 = canon_reaction_smarts(reaction_template, True, "drugbank", True)
-    rxn = AllChem.ReactionFromSmarts(reaction_template)
-    rxn_canon = AllChem.ReactionFromSmarts(canon_rxn1)
+    rxn = rdChemReactions.ReactionFromSmarts(reaction_template)
+    rxn_canon = rdChemReactions.ReactionFromSmarts(canon_rxn1)
 
     reactants = Chem.MolFromSmiles(reactants_in)
     p = rxn.RunReactants((reactants,))

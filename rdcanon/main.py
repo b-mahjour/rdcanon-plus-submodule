@@ -1,5 +1,5 @@
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import rdChemReactions
 import re
 from rdcanon.token_parser import (
     order_token_canon,
@@ -10,6 +10,7 @@ import rdkit
 from collections import deque
 from rdcanon.askcos_prims import prims as prims1
 import random
+import time
 from functools import cmp_to_key
 from rdkit.Chem.rdchem import BondType, BondDir, BondStereo
 from rdkit import RDLogger
@@ -42,7 +43,16 @@ bond_value_map = {
 }
 
 
-def custom_key2(item1t, item2t):
+def custom_key2(item1t, item2t, prefer_less_branched=False):
+    if prefer_less_branched:
+        branch_penalty_1 = item1t.get("branch_penalty", 0)
+        branch_penalty_2 = item2t.get("branch_penalty", 0)
+
+        if branch_penalty_1 != branch_penalty_2:
+            return (branch_penalty_1 > branch_penalty_2) - (
+                branch_penalty_1 < branch_penalty_2
+            )
+
     item1 = item1t["path_scores"]
     item2 = item2t["path_scores"]
 
@@ -53,6 +63,20 @@ def custom_key2(item1t, item2t):
             return (sm1 > sm2) - (sm1 < sm2)
 
     return recursive_compare(item1, item2)
+
+
+def compare_branch_then_score(branch1, score1, branch2, score2):
+    if branch1 != branch2:
+        return (branch1 > branch2) - (branch1 < branch2)
+    return recursive_compare(score1, score2)
+
+
+def _profile_add(profile, key, elapsed):
+    if profile is None:
+        return
+    entry = profile.setdefault(key, {"time": 0.0, "calls": 0})
+    entry["time"] += elapsed
+    entry["calls"] += 1
 
 
 class Node:
@@ -78,22 +102,73 @@ class Node:
 
 
 class Graph:
-    def __init__(self, v=False):
+    def __init__(
+        self,
+        v=False,
+        prefer_less_branched=False,
+        memo=None,
+        truncate_paths=False,
+        profile=None,
+        regen_strategy="legacy",
+    ):
         self.nodes = []
         self.top_score = 0
         self.v = v
+        self.prefer_less_branched = prefer_less_branched
+        self.memo = memo
+        self.truncate_paths = truncate_paths
+        self.profile = profile
+        self.regen_strategy = regen_strategy
         self.bond_indices_to_smarts = {}
         self.bond_indices_to_stereo = {}
         self.bond_indices_to_relative_stereo = {}
         # self.atom_to_original_chiral_tag = {}
 
+    def _is_better_path(self, branch_penalty, path_scores, best_branch, best_scores):
+        if self.prefer_less_branched:
+            return (
+                compare_branch_then_score(
+                    branch_penalty,
+                    path_scores,
+                    best_branch,
+                    best_scores,
+                )
+                < 0
+            )
+        return recursive_compare(path_scores, best_scores) < 0
+
+    def _is_equal_path(self, branch_penalty, path_scores, best_branch, best_scores):
+        if self.prefer_less_branched:
+            return (
+                compare_branch_then_score(
+                    branch_penalty,
+                    path_scores,
+                    best_branch,
+                    best_scores,
+                )
+                == 0
+            )
+        return recursive_compare(path_scores, best_scores) == 0
+
+    def _build_path_scores(self, path):
+        path_scores = []
+        for rr in path:
+            path_scores.append(rr[0].serialized_score)
+            if rr[1] == None:
+                bond_v = "None"
+            else:
+                bond_v = rr[1].name
+            path_scores.append([bond_value_map[bond_v]])
+        return path_scores
+
     def graph_from_smarts(self, smarts, embedding):
+        _time_graph_from_smarts = time.perf_counter()
         proton_mol = Chem.MolFromSmiles("[#1]")
         
         mol = Chem.MolFromSmarts(smarts)
         
-        if Chem.HasQueryHs(mol)[0]:
-            mol = Chem.AdjustQueryProperties(Chem.MergeQueryHs(mol))
+        # if Chem.HasQueryHs(mol)[0]:
+            # mol = Chem.AdjustQueryProperties(Chem.MergeQueryHs(mol))
             # print(Chem.MolToSmarts(mol))
         if not mol:
             raise ValueError("Invalid SMARTS provided")
@@ -108,7 +183,23 @@ class Graph:
             print("token embeddings")
 
         num_atoms = len(mol.GetAtoms())
-        atoms_seq, bonds_seq = parse_smarts_total(smarts, num_atoms)
+        parse_cache = None
+        if self.memo is not None:
+            parse_cache = self.memo.setdefault("parse_smarts_total", {})
+
+        parse_key = (smarts, num_atoms)
+        if parse_cache is not None and parse_key in parse_cache:
+            atoms_seq, bonds_seq = parse_cache[parse_key]
+        else:
+            _time_parse_smarts_total = time.perf_counter()
+            atoms_seq, bonds_seq = parse_smarts_total(smarts, num_atoms)
+            _profile_add(
+                self.profile,
+                "graph_from_smarts.parse_smarts_total",
+                time.perf_counter() - _time_parse_smarts_total,
+            )
+            if parse_cache is not None:
+                parse_cache[parse_key] = (atoms_seq, bonds_seq)
 
         old_idx_to_new_idx = {}
         nnn = 0
@@ -119,8 +210,8 @@ class Graph:
             elif "@" in atoms_seq[atom.GetIdx()]:
                 atom.SetChiralTag(Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW)
 
-            if atom.GetSmarts() == "[H]" or atom.GetSmarts() == "[#1]":
-                continue
+            # if atom.GetSmarts() == "[H]" or atom.GetSmarts() == "[#1]":
+                # continue
 
             min_num_explicit_hs = 0
             opt_num_explicit_hs = 0
@@ -143,22 +234,44 @@ class Graph:
             n = Node(nnn, node_data)
             atom_map = re.findall(r":\d+]", n.data["smarts"])
 
-            if len(atom_map) > 0:
-                sm, sc, _ = order_token_canon(
-                    re.sub(r":\d+]", "]", n.data["smarts"]),
-                    atom_map[0][0:-1],
-                    embedding,
-                    min_num_explicit_hs,
-                    opt_num_explicit_hs
-                )
+            atom_smarts_no_map = re.sub(r":\d+]", "]", n.data["smarts"])
+            atom_map_token = atom_map[0][0:-1] if len(atom_map) > 0 else None
+
+            token_cache = None
+            if self.memo is not None:
+                token_cache = self.memo.setdefault("order_token_canon", {})
+
+            if isinstance(embedding, str):
+                embedding_key = ("name", embedding)
             else:
+                embedding_key = ("id", id(embedding))
+
+            token_key = (
+                atom_smarts_no_map,
+                atom_map_token,
+                embedding_key,
+                min_num_explicit_hs,
+                opt_num_explicit_hs,
+            )
+
+            if token_cache is not None and token_key in token_cache:
+                sm, sc = token_cache[token_key]
+            else:
+                _time_order_token_canon = time.perf_counter()
                 sm, sc, _ = order_token_canon(
-                    re.sub(r":\d+]", "]", n.data["smarts"]),
-                    None,
+                    atom_smarts_no_map,
+                    atom_map_token,
                     embedding,
                     min_num_explicit_hs,
                     opt_num_explicit_hs
                 )
+                _profile_add(
+                    self.profile,
+                    "graph_from_smarts.order_token_canon",
+                    time.perf_counter() - _time_order_token_canon,
+                )
+                if token_cache is not None:
+                    token_cache[token_key] = (sm, sc)
 
             if self.v:
                 print(">", n.data["smarts"], sm, sc)
@@ -259,6 +372,12 @@ class Graph:
             self.bond_indices_to_smarts[(start_idx, end_idx)] = bond.GetSmarts()
             self.bond_indices_to_smarts[(end_idx, start_idx)] = bond.GetSmarts()
 
+        _profile_add(
+            self.profile,
+            "graph_from_smarts.total",
+            time.perf_counter() - _time_graph_from_smarts,
+        )
+
     def replace_at_index(self, original, new_text, start, length):
         end = start + length
         return original[:start] + new_text + original[end:]
@@ -267,19 +386,23 @@ class Graph:
         return original[:start] + new_text + original[start:]
 
     def find_hamiltonian_paths_iterative_sm(self, start_node, best_seen):
+        _time_find_hamiltonian = time.perf_counter()
         paths = []
         smiles_out = []
         node_maps_out = []
         bond_maps_out = []
 
+        best_complete = None
+
         start_node = (self.nodes[start_node], None, None)
 
         sm_so_far1 = start_node[0].data["smarts"]
 
-        pa = [start_node[0].index]
+        pa = (start_node[0].index,)
         node_to_sm_idx = {start_node[0].index: len(sm_so_far1)}
         bond_to_sm_idx = {}
         branch_level = 0
+        branch_penalty = 0
         stack = deque(
             [
                 (
@@ -293,6 +416,7 @@ class Graph:
                     1,
                     bond_to_sm_idx,
                     branch_level,
+                    branch_penalty,
                 )
             ]
         )
@@ -309,6 +433,7 @@ class Graph:
                 ring_num,
                 this_bond_to_sm_idx,
                 this_branch_level,
+                this_branch_penalty,
             ) = stack.popleft()
             if nn > 10000:
                 raise ValueError(
@@ -349,10 +474,47 @@ class Graph:
                     for i in range(this_branch_level):
                         sm_so_far = sm_so_far + ")"
 
-                paths.append(path)
-                smiles_out.append(sm_so_far)
-                node_maps_out.append(this_node_to_sm_idx)
-                bond_maps_out.append(this_bond_to_sm_idx)
+                if self.truncate_paths:
+                    complete_scores = self._build_path_scores(path)
+                    complete_branch_penalty = sm_so_far.count("(")
+                    if best_complete is None:
+                        best_complete = {
+                            "branch_penalty": complete_branch_penalty,
+                            "path_scores": complete_scores,
+                        }
+                        paths = [path]
+                        smiles_out = [sm_so_far]
+                        node_maps_out = [this_node_to_sm_idx]
+                        bond_maps_out = [this_bond_to_sm_idx]
+                    elif self._is_better_path(
+                        complete_branch_penalty,
+                        complete_scores,
+                        best_complete["branch_penalty"],
+                        best_complete["path_scores"],
+                    ):
+                        best_complete = {
+                            "branch_penalty": complete_branch_penalty,
+                            "path_scores": complete_scores,
+                        }
+                        paths = [path]
+                        smiles_out = [sm_so_far]
+                        node_maps_out = [this_node_to_sm_idx]
+                        bond_maps_out = [this_bond_to_sm_idx]
+                    elif self._is_equal_path(
+                        complete_branch_penalty,
+                        complete_scores,
+                        best_complete["branch_penalty"],
+                        best_complete["path_scores"],
+                    ):
+                        paths.append(path)
+                        smiles_out.append(sm_so_far)
+                        node_maps_out.append(this_node_to_sm_idx)
+                        bond_maps_out.append(this_bond_to_sm_idx)
+                else:
+                    paths.append(path)
+                    smiles_out.append(sm_so_far)
+                    node_maps_out.append(this_node_to_sm_idx)
+                    bond_maps_out.append(this_bond_to_sm_idx)
                 continue
 
             all_neighbors_visited = True
@@ -392,6 +554,7 @@ class Graph:
 
             if neighbors_not_visited > 1:
                 this_branch_level = this_branch_level + 1
+                this_branch_penalty = this_branch_penalty + 1
                 sm_so_far = sm_so_far + "("
                 junction.append((current_node, current_bond, curr_bond_smarts))
 
@@ -411,112 +574,139 @@ class Graph:
                         ring_num,
                         this_bond_to_sm_idx,
                         this_branch_level,
+                        this_branch_penalty,
                     )
                 )
 
+            neighbor_candidates = []
             for i, neighbor in enumerate(current_node.bonds):
-                if neighbor.index not in visited:
-                    nei = (
-                        neighbor,
-                        current_node.bond_types[i],
-                        current_node.bond_smarts[i],
-                    )
-                    new_path = path + [nei]
-                    np = []
-                    for rr in new_path:
-                        np.append(rr[0].serialized_score)
-                        if rr[1] == None:
-                            bond_v = "None"
-                        else:
-                            bond_v = rr[1].name
-                        np.append([bond_value_map[bond_v]])
+                if neighbor.index in visited:
+                    continue
 
-                    if len(best_seen) == 0:
-                        best_seen = np
+                nei = (
+                    neighbor,
+                    current_node.bond_types[i],
+                    current_node.bond_smarts[i],
+                )
+                new_path = path + [nei]
+                np = self._build_path_scores(new_path)
+                neighbor_candidates.append((i, neighbor, nei, new_path, np))
+
+            for _, _, _, _, np in neighbor_candidates:
+                if best_seen is None:
+                    best_seen = {
+                        "branch_penalty": this_branch_penalty,
+                        "path_scores": np,
+                    }
+                else:
+                    best_path_scores = best_seen["path_scores"]
+                    if len(np) > len(best_path_scores):
+                        best_seen = {
+                            "branch_penalty": this_branch_penalty,
+                            "path_scores": np,
+                        }
+                    elif len(np) < len(best_path_scores):
+                        pass
                     else:
-                        if len(np) > len(best_seen):
-                            best_seen = np
-                        elif len(np) < len(best_seen):
-                            pass
+                        if self.prefer_less_branched:
+                            is_better_or_equal = (
+                                compare_branch_then_score(
+                                    this_branch_penalty,
+                                    np,
+                                    best_seen["branch_penalty"],
+                                    best_path_scores,
+                                )
+                                <= 0
+                            )
                         else:
-                            if (
-                                min([np, best_seen], key=cmp_to_key(recursive_compare))
-                                == np
-                            ):
-                                best_seen = np
-                            else:
-                                continue
+                            is_better_or_equal = (
+                                recursive_compare(np, best_path_scores) <= 0
+                            )
 
-            for i, neighbor in enumerate(current_node.bonds):
-                if neighbor.index not in visited:
-                    nei = (
-                        neighbor,
-                        current_node.bond_types[i],
-                        current_node.bond_smarts[i],
+                        if is_better_or_equal:
+                            best_seen = {
+                                "branch_penalty": this_branch_penalty,
+                                "path_scores": np,
+                            }
+
+            for i, neighbor, nei, new_path, np in neighbor_candidates:
+                new_visited = visited + (neighbor.index,)
+
+                if best_seen is None:
+                    should_expand = True
+                elif self.prefer_less_branched:
+                    should_expand = (
+                        compare_branch_then_score(
+                            this_branch_penalty,
+                            np,
+                            best_seen["branch_penalty"],
+                            best_seen["path_scores"],
+                        )
+                        <= 0
+                    )
+                else:
+                    should_expand = recursive_compare(np, best_seen["path_scores"]) <= 0
+
+                if should_expand:
+                    tsm_so_far = sm_so_far + current_node.bond_smarts[i]
+                    new_this_bond_to_sm_idx = this_bond_to_sm_idx.copy()
+                    new_this_bond_to_sm_idx[
+                        (current_node.index, neighbor.index)
+                    ] = len(tsm_so_far)
+                    tsm_so_far = tsm_so_far + neighbor.data["smarts"]
+
+                    new_this_node_to_sm_idx = this_node_to_sm_idx.copy()
+
+                    new_this_node_to_sm_idx[neighbor.index] = len(tsm_so_far)
+
+                    if this_branch_level > 0:
+                        next_junction = junction.copy()
+                    else:
+                        next_junction = deque()
+
+                    stack.append(
+                        (
+                            nei,
+                            new_path,
+                            new_visited,
+                            next_junction,
+                            tsm_so_far,
+                            current_node.index,
+                            new_this_node_to_sm_idx,
+                            ring_num,
+                            new_this_bond_to_sm_idx,
+                            this_branch_level,
+                            this_branch_penalty,
+                        )
                     )
 
-                    new_path = path + [nei]
-                    np = []
-                    for rr in new_path:
-                        np.append(rr[0].serialized_score)
-                        if rr[1] == None:
-                            bond_v = "None"
-                        else:
-                            bond_v = rr[1].name
-                        np.append([bond_value_map[bond_v]])
-
-                    new_visited = []
-                    for rr in visited:
-                        new_visited.append(rr)
-                    new_visited.append(neighbor.index)
-
-                    if min([np, best_seen], key=cmp_to_key(recursive_compare)) == np:
-                        tsm_so_far = sm_so_far + current_node.bond_smarts[i]
-                        new_this_bond_to_sm_idx = this_bond_to_sm_idx.copy()
-                        new_this_bond_to_sm_idx[
-                            (current_node.index, neighbor.index)
-                        ] = len(tsm_so_far)
-                        tsm_so_far = tsm_so_far + neighbor.data["smarts"]
-
-                        new_this_node_to_sm_idx = this_node_to_sm_idx.copy()
-
-                        new_this_node_to_sm_idx[neighbor.index] = len(tsm_so_far)
-
-                        stack.append(
-                            (
-                                nei,
-                                new_path,
-                                new_visited,
-                                junction.copy(),
-                                tsm_so_far,
-                                current_node.index,
-                                new_this_node_to_sm_idx,
-                                ring_num,
-                                new_this_bond_to_sm_idx,
-                                this_branch_level,
-                            )
-                        )
-
+        _profile_add(
+            self.profile,
+            "find_hamiltonian_paths_iterative_sm.total",
+            time.perf_counter() - _time_find_hamiltonian,
+        )
         return paths, best_seen, smiles_out, node_maps_out, bond_maps_out
 
     def all_depth_first_search(self):
+        _time_all_depth_first = time.perf_counter()
         if self.v:
             print("enumerated paths")
 
-        node_data = [x.serialized_score for x in self.nodes]
+        if not self.prefer_less_branched:
+            node_data = [x.serialized_score for x in self.nodes]
 
-        n = min(node_data, key=cmp_to_key(recursive_compare))
-        top_nodes = []
-        for i, nd in enumerate(node_data):
-            if nd == n:
-                top_nodes.append(i)
+            n = min(node_data, key=cmp_to_key(recursive_compare))
+            top_nodes = []
+            for i, nd in enumerate(node_data):
+                if nd == n:
+                    top_nodes.append(i)
 
         poss_paths = []
         all_paths_scored = []
         path_idx = 0
-        best_seen = []
+        best_seen = None
         for idx, h in enumerate(self.nodes):
-            if idx not in top_nodes:
+            if not self.prefer_less_branched and idx not in top_nodes:
                 continue
 
             all_paths, new_best_seen, sm_o, node_map, bond_map = (
@@ -539,6 +729,7 @@ class Graph:
                         "path_scores": path_ar,
                         "path": r,
                         "smarts": sm_o[i],
+                        "branch_penalty": sm_o[i].count("("),
                         "node_map": node_map[i],
                         "bond_map": bond_map[i],
                     }
@@ -558,7 +749,16 @@ class Graph:
             for kk in all_paths_scored:
                 print(">", kk)
 
-        these_weights = sorted(all_paths_scored, key=cmp_to_key(custom_key2))
+        these_weights = sorted(
+            all_paths_scored,
+            key=cmp_to_key(
+                lambda a, b: custom_key2(
+                    a,
+                    b,
+                    prefer_less_branched=self.prefer_less_branched,
+                )
+            ),
+        )
 
         if self.v:
             print()
@@ -567,13 +767,28 @@ class Graph:
                 print(">", kk)
 
         top_tied = []
-        top_score = these_weights[0]["path_scores"]
-        for i, p in enumerate(these_weights):
+        if self.prefer_less_branched:
+            min_branch_penalty = min(p["branch_penalty"] for p in these_weights)
+            candidate_pool = [
+                p
+                for p in these_weights
+                if p["branch_penalty"] == min_branch_penalty
+            ]
+        else:
+            candidate_pool = these_weights
+
+        top_score = candidate_pool[0]["path_scores"]
+        for p in candidate_pool:
             if p["path_scores"] == top_score:
                 top_tied.append(p)
             else:
                 break
 
+        _profile_add(
+            self.profile,
+            "all_depth_first_search.total",
+            time.perf_counter() - _time_all_depth_first,
+        )
         return top_tied
 
     def can_transform(self, set1, set2):
@@ -615,12 +830,18 @@ class Graph:
         top_scores = self.all_depth_first_search()
         sms = []
         for top_score in top_scores:
-            unmapped, mapped = self.regen_molecule(
-                top_score["path"],
-                top_score["smarts"],
-                top_score["node_map"],
-                top_score["bond_map"],
-            )
+            if self.regen_strategy == "fragment":
+                unmapped, mapped = self.regen_molecule_fragment(
+                    top_score["path"],
+                    top_score["smarts"],
+                )
+            else:
+                unmapped, mapped = self.regen_molecule(
+                    top_score["path"],
+                    top_score["smarts"],
+                    top_score["node_map"],
+                    top_score["bond_map"],
+                )
 
             sms.append(
                 (
@@ -643,7 +864,56 @@ class Graph:
         end = start + length
         return original[:start] + original[end:]
 
+    def regen_molecule_fragment(self, dfs, smarts_in):
+        _time_regen_molecule_fragment = time.perf_counter()
+
+        mol = Chem.MolFromSmarts(smarts_in)
+        if mol is None:
+            raise ValueError("Invalid SMARTS template provided for fragment regeneration")
+
+        old_map_to_new_map = {}
+        for idx, atom in enumerate(mol.GetAtoms()):
+            node, _, _ = dfs[idx]
+            atom.SetChiralTag(node.data["stereo"])
+            atom.SetAtomMapNum(node.index)
+            old_map_to_new_map[node.index] = idx
+
+        num_atoms = mol.GetNumAtoms()
+        atom_symbols = [atom.GetSmarts() for atom in mol.GetAtoms()]
+        bond_symbols = [bond.GetSmarts() for bond in mol.GetBonds()]
+        bonds_to_use = list(range(mol.GetNumBonds()))
+
+        rooted_at_atom = 0
+        if len(dfs) > 0:
+            rooted_at_atom = old_map_to_new_map.get(dfs[0][0].index, 0)
+
+        # smilesWriteParams = Chem.SmilesWriteParams()
+        # smilesWriteParams.doIsomericSmiles = True
+        # smilesWriteParams.canonical = False
+        # smilesWriteParams.doKekule = False
+        # smilesWriteParams.
+        # smilesWriteParams.rootedAtAtom = rooted_at_atom
+        smarts_mapped = Chem.MolFragmentToSmarts(
+            mol,
+            # smilesWriteParams,
+            atomsToUse=list(range(num_atoms)),
+            bondsToUse=bonds_to_use,
+            atomSymbols=atom_symbols,
+            bondSymbols=bond_symbols,
+        )
+
+        smarts_unmapped = re.sub(r":\d+\]", "]", smarts_mapped)
+
+        _profile_add(
+            self.profile,
+            "regen_molecule_fragment.total",
+            time.perf_counter() - _time_regen_molecule_fragment,
+        )
+
+        return smarts_unmapped, smarts_mapped
+
     def regen_molecule(self, dfs, smarts_in, node_map, bond_map):
+        _time_regen_molecule = time.perf_counter()
         old_map_to_new_map = {}
         i = 0
         idxes_out = []
@@ -1043,6 +1313,12 @@ class Graph:
         smarts_in_no_map = re.sub(r":\d+]", "]", smarts_in)
         smarts_in_mapped = smarts_in
 
+        _profile_add(
+            self.profile,
+            "regen_molecule.total",
+            time.perf_counter() - _time_regen_molecule,
+        )
+
         return smarts_in_no_map, smarts_in_mapped
 
     def __repr__(self):
@@ -1057,6 +1333,11 @@ class Reaction:
         embedding,
         remapping=False,
         v=False,
+        prefer_less_branched=False,
+        memo=None,
+        truncate_paths=False,
+        profile=None,
+        regen_strategy="legacy",
         repl_dict={},
     ):
         self.reactants = []
@@ -1067,6 +1348,11 @@ class Reaction:
         self.embedding = embedding
         self.remapping = remapping
         self.v = v
+        self.prefer_less_branched = prefer_less_branched
+        self.memo = memo
+        self.truncate_paths = truncate_paths
+        self.profile = profile
+        self.regen_strategy = regen_strategy
         self.index = 1
         self.index_map = {}
         self.repl_dict = repl_dict
@@ -1091,6 +1377,11 @@ class Reaction:
                     self.mapping,
                     self.embedding,
                     return_score=True,
+                    prefer_less_branched=self.prefer_less_branched,
+                    memo=self.memo,
+                    truncate_paths=self.truncate_paths,
+                    profile=self.profile,
+                    regen_strategy=self.regen_strategy,
                     repl_dict=self.repl_dict,
                 )
                 grouped.append(
@@ -1139,6 +1430,11 @@ class Reaction:
                     self.mapping,
                     self.embedding,
                     return_score=True,
+                    prefer_less_branched=self.prefer_less_branched,
+                    memo=self.memo,
+                    truncate_paths=self.truncate_paths,
+                    profile=self.profile,
+                    regen_strategy=self.regen_strategy,
                     repl_dict=self.repl_dict,
                 )
                 grouped.append(
@@ -1186,6 +1482,11 @@ class Reaction:
                     self.mapping,
                     self.embedding,
                     return_score=True,
+                    prefer_less_branched=self.prefer_less_branched,
+                    memo=self.memo,
+                    truncate_paths=self.truncate_paths,
+                    profile=self.profile,
+                    regen_strategy=self.regen_strategy,
                     repl_dict=self.repl_dict,
                 )
                 grouped.append(
@@ -1268,7 +1569,7 @@ class Reaction:
         return parts
 
     def canonicalize_template(self):
-        k = AllChem.ReactionFromSmarts(self.input_reaction_smarts)
+        k = rdChemReactions.ReactionFromSmarts(self.input_reaction_smarts)
         if len(k.GetAgents()) > 0:
             comps = self.input_reaction_smarts.split(">")
             if len(comps) == 3:
@@ -1345,6 +1646,11 @@ def canon_smarts(
     embedding="drugbank",
     return_score=False,
     v=False,
+    prefer_less_branched=False,
+    memo=None,
+    truncate_paths=False,
+    profile=None,
+    regen_strategy="fragment",
     repl_dict={},
 ):
     """
@@ -1356,21 +1662,35 @@ def canon_smarts(
         embedding (str, optional): The query primitive frequency dictionary to use. Defaults to "drugbank".
         return_score (bool, optional): Whether to return the top score. Defaults to False.
         v (bool, optional): Whether to enable verbose mode. Defaults to False.
+        prefer_less_branched (bool, optional): Whether to prefer least-branched serializations before score tie-breakers. Defaults to False.
+        memo (dict, optional): Reusable cache dictionary for repeated canonicalization calls.
+        truncate_paths (bool, optional): Whether to keep only best/tied-best complete DFS paths instead of all complete paths. Defaults to False.
+        profile (dict, optional): Reusable profiling accumulator across calls.
+        regen_strategy (str, optional): Regeneration method, either "legacy" or "fragment". Defaults to "legacy".
         repl_dict (dictionary, optional): A dictionary of SMARTS token replacements.
 
     Returns:
         str or tuple: The canonicalized SMARTS pattern. If `return_score` is True, a tuple containing the canonicalized SMARTS pattern,
         the top score, and the unmapped canonical SMARTS pattern is returned.
     """
-    g = Graph(v)
+    _time_canon_smarts = time.perf_counter()
+    g = Graph(
+        v,
+        prefer_less_branched=prefer_less_branched,
+        memo=memo,
+        truncate_paths=truncate_paths,
+        profile=profile,
+        regen_strategy=regen_strategy,
+    )
     g.graph_from_smarts(smarts, embedding)
     out = g.recreate_molecule(mapping)
-
     for k in repl_dict:
         out = out.replace(k, repl_dict[k])
 
     if return_score:
+        _profile_add(profile, "canon_smarts.total", time.perf_counter() - _time_canon_smarts)
         return out, g.top_score, g.unmapped_canon
+    _profile_add(profile, "canon_smarts.total", time.perf_counter() - _time_canon_smarts)
     return out
 
 
@@ -1398,7 +1718,16 @@ def debug(smarts, mapping=False, embedding="drugbank", return_score=False):
 
 
 def canon_reaction_smarts(
-    smarts, mapping=False, embedding="drugbank", remapping=False, repl_dict={}
+    smarts,
+    mapping=False,
+    embedding="drugbank",
+    remapping=False,
+    prefer_less_branched=False,
+    memo=None,
+    truncate_paths=False,
+    profile=None,
+    regen_strategy="legacy",
+    repl_dict={},
 ):
     """
     Canonicalizes a reaction SMARTS string.
@@ -1408,6 +1737,11 @@ def canon_reaction_smarts(
         mapping (bool, optional): Whether to include atom mapping in the canonicalization. Defaults to False.
         embedding (str, optional): The embedding to use for the canonicalization. Defaults to "drugbank".
         remapping (bool, optional): Whether to remap atom indices after canonicalization. Defaults to True.
+        prefer_less_branched (bool, optional): Whether to prefer least-branched serializations before score tie-breakers. Defaults to False.
+        memo (dict, optional): Reusable cache dictionary for repeated canonicalization calls.
+        truncate_paths (bool, optional): Whether to keep only best/tied-best complete DFS paths instead of all complete paths. Defaults to False.
+        profile (dict, optional): Reusable profiling accumulator across calls.
+        regen_strategy (str, optional): Regeneration method, either "legacy" or "fragment". Defaults to "legacy".
         repl_dict (dictionary, optional): A dictionary of SMARTS token replacements.
 
     Returns:
@@ -1417,5 +1751,16 @@ def canon_reaction_smarts(
     if remapping == True:
         mapping = True
 
-    reaction = Reaction(smarts, mapping, embedding, remapping, repl_dict=repl_dict)
+    reaction = Reaction(
+        smarts,
+        mapping,
+        embedding,
+        remapping,
+        prefer_less_branched=prefer_less_branched,
+        memo=memo,
+        truncate_paths=truncate_paths,
+        profile=profile,
+        regen_strategy=regen_strategy,
+        repl_dict=repl_dict,
+    )
     return reaction.canonicalize_template()
