@@ -10,15 +10,8 @@ description = "SMARTS Sanitization/Canonicalization"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "rdkit>2023.09.1",
-    "matplotlib",
     "lark",
-    "numpy",
     "networkx",
-    "scikit-learn",
-    "ipykernel",
-    "pandas",
-    "openpyxl",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
