@@ -6,15 +6,25 @@ from rdcanon.token_parser import (
     recursive_compare,
     parse_smarts_total,
 )
+from rdcanon.query_primitive_extractor import extract_primitives_from_atom_query
 import rdkit
 from collections import deque
 from rdcanon.askcos_prims import prims as prims1
+from rdcanon.pubchem_prims import prims as prims2
+from rdcanon.drugbank_prims_with_nots import prims as prims3
+from rdcanon.np_prims import prims as prims4
 import random
 import time
 from functools import cmp_to_key
 from rdkit.Chem.rdchem import BondType, BondDir, BondStereo
 from rdkit import RDLogger
 RDLogger.DisableLog("rdApp.*")
+
+EPS_SCORE = 1e-12
+LEAF_HETERO_ATOMS = {
+    "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "Se", "Te",
+    "n", "o", "s", "p", "b",
+}
 
 bond_value_map = {
     "UNSPECIFIED": 1000,
@@ -122,7 +132,97 @@ class Graph:
         self.bond_indices_to_smarts = {}
         self.bond_indices_to_stereo = {}
         self.bond_indices_to_relative_stereo = {}
+        self.original_root_index = 0
         # self.atom_to_original_chiral_tag = {}
+
+    def _get_primitive_freq_map(self, embedding):
+        if isinstance(embedding, dict):
+            return embedding
+
+        if embedding == "askcos":
+            return prims1
+        if embedding == "pubchem":
+            return prims2
+        if embedding == "drugbank":
+            return prims3
+        if embedding == "npatlas":
+            return prims4
+        return {}
+
+    def _extract_primitives_from_atom_query(self, atom_smarts):
+        return extract_primitives_from_atom_query(atom_smarts)
+
+    def _frequency_for_atom_query(self, atom_smarts, embedding):
+        prim_freqs = self._get_primitive_freq_map(embedding)
+
+        candidates = []
+        if isinstance(atom_smarts, str) and atom_smarts:
+            candidates.append(atom_smarts)
+            if atom_smarts.startswith("[") and atom_smarts.endswith("]"):
+                candidates.append(atom_smarts[1:-1])
+            no_map = re.sub(r":\d+\]", "]", atom_smarts)
+            if no_map != atom_smarts:
+                candidates.append(no_map)
+                if no_map.startswith("[") and no_map.endswith("]"):
+                    candidates.append(no_map[1:-1])
+
+        for cand in candidates:
+            if isinstance(prim_freqs, dict) and cand in prim_freqs:
+                return float(prim_freqs[cand])
+
+        prim_tokens = self._extract_primitives_from_atom_query(atom_smarts)
+        # print(prim_tokens)
+        if not prim_tokens:
+            return 1e6
+
+        product = 1.0
+        for prim in prim_tokens:
+            val = None
+            if isinstance(prim_freqs, dict):
+                val = prim_freqs.get(prim)
+                if val is None and prim.startswith("!"):
+                    val = prim_freqs.get(prim[1:])
+            if val is None:
+                val = 1e3
+            product *= float(val)
+        return product
+
+    def _is_leaf_hetero(self, atom_smarts, degree):
+        if degree != 1:
+            return False
+        if not isinstance(atom_smarts, str):
+            return False
+
+        core = atom_smarts
+        if core.startswith("[") and core.endswith("]"):
+            core = core[1:-1]
+        core = re.sub(r":\d+", "", core)
+        hits = re.findall(r"Cl|Br|[A-Z][a-z]?|[a-z]", core)
+        if not hits:
+            return False
+        first_atom = hits[0]
+        return first_atom in LEAF_HETERO_ATOMS
+
+    def _apply_anchor_scores(self, embedding):
+        for node in self.nodes:
+            atom_smarts = node.data["smarts"]
+            degree = len(node.bonds)
+            local_or_count = atom_smarts.count(",") if isinstance(atom_smarts, str) else 0
+            freq = self._frequency_for_atom_query(atom_smarts, embedding)
+
+            base_rarity = 1.0 / (float(freq) + EPS_SCORE)
+            leaf_penalty = 0.05 if degree == 1 else 1.0
+            degree_bonus = 1.0 + 0.5 * max(0, degree - 2)
+            or_penalty = 1.0 / (1.0 + local_or_count)
+            final_score = base_rarity * degree_bonus * leaf_penalty * or_penalty
+
+            token_score = node.data.get("token_score", node.serialized_score)
+            anchor_rank = 1.0 / (final_score + EPS_SCORE)
+            node.data["query_degree"] = degree
+            node.data["anchor_score_value"] = final_score
+            node.data["anchor_priority_value"] = anchor_rank
+            node.data["is_leaf_hetero"] = self._is_leaf_hetero(atom_smarts, degree)
+            node.serialized_score = [[anchor_rank], token_score]
 
     def _is_better_path(self, branch_penalty, path_scores, best_branch, best_scores):
         if self.prefer_less_branched:
@@ -254,7 +354,32 @@ class Graph:
                 opt_num_explicit_hs,
             )
 
-            if token_cache is not None and token_key in token_cache:
+            embedded_atom_score = None
+            if isinstance(embedding, dict):
+                candidate_keys = []
+
+                original_token = n.data["smarts"]
+                if isinstance(original_token, str) and original_token:
+                    candidate_keys.append(original_token)
+                    if original_token.startswith("[") and original_token.endswith("]"):
+                        candidate_keys.append(original_token[1:-1])
+
+                if isinstance(atom_smarts_no_map, str) and atom_smarts_no_map:
+                    candidate_keys.append(atom_smarts_no_map)
+                    if atom_smarts_no_map.startswith("[") and atom_smarts_no_map.endswith("]"):
+                        candidate_keys.append(atom_smarts_no_map[1:-1])
+
+                for cand in candidate_keys:
+                    if cand in embedding:
+                        embedded_atom_score = embedding[cand]
+                        break
+
+            if embedded_atom_score is not None:
+                sm = n.data["smarts"]
+                sc = [embedded_atom_score]
+                if token_cache is not None:
+                    token_cache[token_key] = (sm, sc)
+            elif token_cache is not None and token_key in token_cache:
                 sm, sc = token_cache[token_key]
             else:
                 _time_order_token_canon = time.perf_counter()
@@ -285,8 +410,11 @@ class Graph:
 
             n.score_original = 1 / single_score
             n.serialized_score = sc
+            n.data["token_score"] = sc
             n.data["smarts"] = sm
             old_idx_to_new_idx[atom.GetIdx()] = nnn
+            if atom.GetIdx() == 0:
+                self.original_root_index = nnn
             nnn = nnn + 1
             self.nodes.append(n)
         if self.v:
@@ -371,6 +499,8 @@ class Graph:
 
             self.bond_indices_to_smarts[(start_idx, end_idx)] = bond.GetSmarts()
             self.bond_indices_to_smarts[(end_idx, start_idx)] = bond.GetSmarts()
+
+        self._apply_anchor_scores(embedding)
 
         _profile_add(
             self.profile,
@@ -592,6 +722,11 @@ class Graph:
                 np = self._build_path_scores(new_path)
                 neighbor_candidates.append((i, neighbor, nei, new_path, np))
 
+            neighbor_candidates.sort(
+                key=lambda item: item[1].data.get("anchor_score_value", 0.0),
+                reverse=True,
+            )
+
             for _, _, _, _, np in neighbor_candidates:
                 if best_seen is None:
                     best_seen = {
@@ -693,13 +828,39 @@ class Graph:
             print("enumerated paths")
 
         if not self.prefer_less_branched:
-            node_data = [x.serialized_score for x in self.nodes]
+            root_is_leaf_hetero = (
+                0 <= self.original_root_index < len(self.nodes)
+                and self.nodes[self.original_root_index].data.get("is_leaf_hetero", False)
+                and self.nodes[self.original_root_index].data.get("query_degree", 0) == 1
+            )
+            if root_is_leaf_hetero:
+                top_nodes = [self.original_root_index]
+            else:
+                priorities = [
+                    node.data.get("anchor_priority_value", float("inf"))
+                    for node in self.nodes
+                ]
+                min_priority = min(priorities)
+                top_nodes = [
+                    i
+                    for i, p in enumerate(priorities)
+                    if p == min_priority
+                ]
 
-            n = min(node_data, key=cmp_to_key(recursive_compare))
-            top_nodes = []
-            for i, nd in enumerate(node_data):
-                if nd == n:
-                    top_nodes.append(i)
+                filtered = []
+                for idx in top_nodes:
+                    is_leaf_hetero = self.nodes[idx].data.get("is_leaf_hetero", False)
+                    is_degree_one = self.nodes[idx].data.get("query_degree", 0) == 1
+                    if is_leaf_hetero and is_degree_one and idx != self.original_root_index:
+                        continue
+                    filtered.append(idx)
+
+                if filtered:
+                    top_nodes = filtered
+                elif 0 <= self.original_root_index < len(self.nodes):
+                    top_nodes = [self.original_root_index]
+                else:
+                    top_nodes = list(range(len(self.nodes)))
 
         poss_paths = []
         all_paths_scored = []

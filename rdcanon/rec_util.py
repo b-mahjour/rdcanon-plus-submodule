@@ -4,6 +4,13 @@ import rdkit
 from rdkit import Chem
 import re
 from rdkit.Chem.rdchem import BondType, BondDir, BondStereo
+from rdcanon.query_primitive_extractor import extract_primitives_from_atom_query
+
+EPS_SCORE = 1e-12
+LEAF_HETERO_ATOMS = {
+    "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "Se", "Te",
+    "n", "o", "s", "p", "b",
+}
 
 bond_value_map = {
     "UNSPECIFIED": 1000,
@@ -63,6 +70,77 @@ class RecGraph:
         self.bond_indices_to_smarts = {}
         self.bond_indices_to_stereo = {}
         self.bond_indices_to_relative_stereo = {}
+        self.original_root_index = 0
+
+    def _extract_primitives_from_atom_query(self, atom_smarts):
+        return extract_primitives_from_atom_query(atom_smarts)
+
+    def _frequency_for_atom_query(self, atom_smarts, embedding):
+        prim_freqs = embedding if isinstance(embedding, dict) else {}
+
+        candidates = []
+        if isinstance(atom_smarts, str) and atom_smarts:
+            candidates.append(atom_smarts)
+            if atom_smarts.startswith("[") and atom_smarts.endswith("]"):
+                candidates.append(atom_smarts[1:-1])
+            no_map = re.sub(r":\d+\]", "]", atom_smarts)
+            if no_map != atom_smarts:
+                candidates.append(no_map)
+                if no_map.startswith("[") and no_map.endswith("]"):
+                    candidates.append(no_map[1:-1])
+
+        for cand in candidates:
+            if cand in prim_freqs:
+                return float(prim_freqs[cand])
+
+        prim_tokens = self._extract_primitives_from_atom_query(atom_smarts)
+        if not prim_tokens:
+            return 1e6
+
+        product = 1.0
+        for prim in prim_tokens:
+            val = prim_freqs.get(prim)
+            if val is None and prim.startswith("!"):
+                val = prim_freqs.get(prim[1:])
+            if val is None:
+                val = 1e3
+            product *= float(val)
+        return product
+
+    def _is_leaf_hetero(self, atom_smarts, degree):
+        if degree != 1:
+            return False
+        if not isinstance(atom_smarts, str):
+            return False
+        core = atom_smarts
+        if core.startswith("[") and core.endswith("]"):
+            core = core[1:-1]
+        core = re.sub(r":\d+", "", core)
+        hits = re.findall(r"Cl|Br|[A-Z][a-z]?|[a-z]", core)
+        if not hits:
+            return False
+        return hits[0] in LEAF_HETERO_ATOMS
+
+    def _apply_anchor_scores(self, embedding):
+        for node in self.nodes:
+            atom_smarts = node.data["smarts"]
+            degree = len(node.bonds)
+            local_or_count = atom_smarts.count(",") if isinstance(atom_smarts, str) else 0
+            freq = self._frequency_for_atom_query(atom_smarts, embedding)
+
+            base_rarity = 1.0 / (float(freq) + EPS_SCORE)
+            leaf_penalty = 0.05 if degree == 1 else 1.0
+            degree_bonus = 1.0 + 0.5 * max(0, degree - 2)
+            or_penalty = 1.0 / (1.0 + local_or_count)
+            final_score = base_rarity * degree_bonus * leaf_penalty * or_penalty
+
+            token_score = node.data.get("token_score", node.serialized_score)
+            anchor_rank = 1.0 / (final_score + EPS_SCORE)
+            node.data["query_degree"] = degree
+            node.data["anchor_score_value"] = final_score
+            node.data["anchor_priority_value"] = anchor_rank
+            node.data["is_leaf_hetero"] = self._is_leaf_hetero(atom_smarts, degree)
+            node.serialized_score = [[anchor_rank], token_score]
 
     def custom_key2(self, item1t, item2t):
         item1 = item1t["path_scores"]
@@ -78,6 +156,8 @@ class RecGraph:
 
     def graph_from_smarts(self, mol, order_token_canon, embedding):
         mol = Chem.MolFromSmarts(mol)
+        if mol is None:
+            raise ValueError("Invalid recursive SMARTS provided")
         for i, atom in enumerate(mol.GetAtoms()):
             node_data = {
                 "smarts": atom.GetSmarts(),
@@ -85,10 +165,39 @@ class RecGraph:
             }
             n = RecNode(atom.GetIdx(), node_data)
 
-            sm, sc, _ = order_token_canon(n.data["smarts"], None, embedding)
+            embedded_atom_score = None
+            if isinstance(embedding, dict):
+                candidate_keys = []
+
+                original_token = n.data["smarts"]
+                if isinstance(original_token, str) and original_token:
+                    candidate_keys.append(original_token)
+                    if original_token.startswith("[") and original_token.endswith("]"):
+                        candidate_keys.append(original_token[1:-1])
+
+                    original_token_no_map = re.sub(r":\d+\]", "]", original_token)
+                    if original_token_no_map != original_token:
+                        candidate_keys.append(original_token_no_map)
+                        if original_token_no_map.startswith("[") and original_token_no_map.endswith("]"):
+                            candidate_keys.append(original_token_no_map[1:-1])
+
+                for cand in candidate_keys:
+                    if cand in embedding:
+                        embedded_atom_score = embedding[cand]
+                        break
+
+            if embedded_atom_score is not None:
+                sm = n.data["smarts"]
+                sc = [embedded_atom_score]
+            else:
+                sm, sc, _ = order_token_canon(n.data["smarts"], None, embedding)
 
             n.serialized_score = sc
+            n.data["token_score"] = sc
             n.data["smarts"] = sm
+
+            if atom.GetIdx() == 0:
+                self.original_root_index = atom.GetIdx()
 
             self.nodes.append(n)
 
@@ -161,6 +270,8 @@ class RecGraph:
 
             self.bond_indices_to_smarts[(start_idx, end_idx)] = bond.GetSmarts()
             self.bond_indices_to_smarts[(end_idx, start_idx)] = bond.GetSmarts()
+
+        self._apply_anchor_scores(embedding)
 
     def replace_at_index(self, original, new_text, start, length):
         end = start + length
@@ -313,7 +424,14 @@ class RecGraph:
                     )
                 )
 
-            for i, neighbor in enumerate(current_node.bonds):
+            neighbor_order = sorted(
+                range(len(current_node.bonds)),
+                key=lambda idx: current_node.bonds[idx].data.get("anchor_score_value", 0.0),
+                reverse=True,
+            )
+
+            for i in neighbor_order:
+                neighbor = current_node.bonds[i]
                 if neighbor.index not in visited:
                     nei = (
                         neighbor,
@@ -349,7 +467,8 @@ class RecGraph:
                             else:
                                 continue
 
-            for i, neighbor in enumerate(current_node.bonds):
+            for i in neighbor_order:
+                neighbor = current_node.bonds[i]
                 if neighbor.index not in visited:
                     nei = (
                         neighbor,
@@ -408,37 +527,68 @@ class RecGraph:
         poss_paths = []
         all_paths_scored = []
         path_idx = 0
-        all_paths, best_seen, sm_o, node_map, bond_map = (
-            self.find_hamiltonian_paths_iterative_sm(0, [])
+        root_is_leaf_hetero = (
+            0 <= self.original_root_index < len(self.nodes)
+            and self.nodes[self.original_root_index].data.get("is_leaf_hetero", False)
+            and self.nodes[self.original_root_index].data.get("query_degree", 0) == 1
         )
+        if root_is_leaf_hetero:
+            top_nodes = [self.original_root_index]
+        else:
+            priorities = [
+                node.data.get("anchor_priority_value", float("inf"))
+                for node in self.nodes
+            ]
+            min_priority = min(priorities)
+            top_nodes = [i for i, p in enumerate(priorities) if p == min_priority]
 
-        for i, r in enumerate(all_paths):
-            path_ar = []
-            for rr in r:
-                path_ar.append(rr[0].serialized_score)
-                if rr[1] == None:
-                    bond_v = "None"
-                else:
-                    bond_v = rr[1].name
+            filtered = []
+            for idx in top_nodes:
+                is_leaf_hetero = self.nodes[idx].data.get("is_leaf_hetero", False)
+                is_degree_one = self.nodes[idx].data.get("query_degree", 0) == 1
+                if is_leaf_hetero and is_degree_one and idx != self.original_root_index:
+                    continue
+                filtered.append(idx)
+            if filtered:
+                top_nodes = filtered
+            elif 0 <= self.original_root_index < len(self.nodes):
+                top_nodes = [self.original_root_index]
+            else:
+                top_nodes = list(range(len(self.nodes)))
 
-                path_ar.append([bond_value_map[bond_v]])
-            all_paths_scored.append(
-                {
-                    "path_scores": path_ar,
-                    "path": r,
-                    "smarts": sm_o[i],
-                    "node_map": node_map[i],
-                    "bond_map": bond_map[i],
-                }
+        best_seen = []
+        for idx in top_nodes:
+            all_paths, best_seen, sm_o, node_map, bond_map = (
+                self.find_hamiltonian_paths_iterative_sm(idx, best_seen)
             )
-            if self.v:
-                print("> path", path_idx)
-                for rr in r:
-                    print(">>", rr[0], rr[0].serialized_score, rr[1])
-                print(">>", path_ar)
 
-            poss_paths.append(r)
-            path_idx = path_idx + 1
+            for i, r in enumerate(all_paths):
+                path_ar = []
+                for rr in r:
+                    path_ar.append(rr[0].serialized_score)
+                    if rr[1] == None:
+                        bond_v = "None"
+                    else:
+                        bond_v = rr[1].name
+
+                    path_ar.append([bond_value_map[bond_v]])
+                all_paths_scored.append(
+                    {
+                        "path_scores": path_ar,
+                        "path": r,
+                        "smarts": sm_o[i],
+                        "node_map": node_map[i],
+                        "bond_map": bond_map[i],
+                    }
+                )
+                if self.v:
+                    print("> path", path_idx)
+                    for rr in r:
+                        print(">>", rr[0], rr[0].serialized_score, rr[1])
+                    print(">>", path_ar)
+
+                poss_paths.append(r)
+                path_idx = path_idx + 1
 
         if self.v:
             print()

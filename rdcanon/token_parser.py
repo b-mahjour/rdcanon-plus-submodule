@@ -12,7 +12,9 @@ from rdcanon.drugbank_prims_with_nots import prims as prims3
 from rdcanon.np_prims import prims as prims4
 from functools import cmp_to_key
 from rdcanon.rec_util import RecGraph
+from rdcanon.query_primitive_extractor import extract_primitives_from_atom_query
 import re
+from rdkit import Chem
 
 
 # PRIMITIVE:  "D" | "H" | "h" | "R" | "r" | "v" | "X" | "x" | "-" | "+" | "#"
@@ -48,6 +50,8 @@ bond_value_map = {
     "ZERO": 4,
 }
 
+EPS_SCORE = 1e-12
+
 
 def hash_smarts(in_smarts, in_prims, func="sha256"):
     if func == "sha256":
@@ -69,6 +73,103 @@ def hash_smarts(in_smarts, in_prims, func="sha256"):
             else:
                 val = in_prims[in_smarts]
     return val
+
+
+def _extract_primitives_from_atom_query(atom_smarts):
+    return extract_primitives_from_atom_query(atom_smarts)
+
+
+def _frequency_for_atom_query(atom_smarts, prims):
+    primitive_freqs = prims if isinstance(prims, dict) else {}
+
+    candidates = []
+    if isinstance(atom_smarts, str) and atom_smarts:
+        candidates.append(atom_smarts)
+        if atom_smarts.startswith("[") and atom_smarts.endswith("]"):
+            candidates.append(atom_smarts[1:-1])
+        no_map = re.sub(r":\d+\]", "]", atom_smarts)
+        if no_map != atom_smarts:
+            candidates.append(no_map)
+            if no_map.startswith("[") and no_map.endswith("]"):
+                candidates.append(no_map[1:-1])
+
+    for cand in candidates:
+        if isinstance(primitive_freqs, dict) and cand in primitive_freqs:
+            return float(primitive_freqs[cand])
+
+    prim_tokens = _extract_primitives_from_atom_query(atom_smarts)
+    if not prim_tokens:
+        return 1e6
+
+    product = 1.0
+    for prim in prim_tokens:
+        val = None
+        if isinstance(primitive_freqs, dict):
+            val = primitive_freqs.get(prim)
+            if val is None and prim.startswith("!"):
+                val = primitive_freqs.get(prim[1:])
+        if val is None:
+            val = 1e3
+        product *= float(val)
+    return product
+
+
+def _branch_to_smarts_for_root(branch_text):
+    if not isinstance(branch_text, str) or not branch_text:
+        return None
+    txt = branch_text
+    if txt.startswith("!$(") and txt.endswith(")"):
+        return txt[3:-1]
+    if txt.startswith("$(") and txt.endswith(")"):
+        return txt[2:-1]
+    if txt.startswith("[") and txt.endswith("]"):
+        return txt
+    return f"[{txt}]"
+
+
+def _score_branch_root(branch_text, prims):
+    smarts = _branch_to_smarts_for_root(branch_text)
+    if not smarts:
+        return 0.0
+
+    mol = Chem.MolFromSmarts(smarts)
+    if mol is None or mol.GetNumAtoms() == 0:
+        atom_smarts = branch_text
+        degree = 1
+    else:
+        atom = mol.GetAtomWithIdx(0)
+        atom_smarts = atom.GetSmarts()
+        degree = max(1, len(atom.GetNeighbors()))
+
+    local_or_count = atom_smarts.count(",") if isinstance(atom_smarts, str) else 0
+    freq = _frequency_for_atom_query(atom_smarts, prims)
+
+    base_rarity = 1.0 / (float(freq) + EPS_SCORE)
+    leaf_penalty = 0.05 if degree == 1 else 1.0
+    degree_bonus = 1.0 + 0.5 * max(0, degree - 2)
+    or_penalty = 1.0 / (1.0 + local_or_count)
+    return base_rarity * degree_bonus * leaf_penalty * or_penalty
+
+
+def _ring_closure_count(smarts_text):
+    if not isinstance(smarts_text, str):
+        return 0
+    return len(re.findall(r"%\d{2}|\d", smarts_text))
+
+
+def _or_branch_sort_key(weight_item, prims):
+    _, text = weight_item
+    txt = text if isinstance(text, str) else ""
+    root_score = _score_branch_root(txt, prims)
+    return (
+        -root_score,
+        txt.count("$("),
+        txt.count(","),
+        txt.count("~"),
+        _ring_closure_count(txt),
+        len(txt),
+        txt,
+    )
 
 
 prims1["*"] = 10e64
@@ -1761,7 +1862,19 @@ def order_token_canon(
             else:
                 inc = 0
             if prim_sm[0 + inc] == "$":
-                pass
+                # Prefer whole-recursive embedding when explicitly provided,
+                # e.g. $(CCN) in the embedding map; otherwise keep existing
+                # recursive-structure weights from RecGraph.
+                has_recursive_embedding = False
+                if isinstance(prims, dict):
+                    if prim_sm in prims:
+                        has_recursive_embedding = True
+                    elif prim_sm.startswith("!$") and prim_sm[1:] in prims:
+                        has_recursive_embedding = True
+                if has_recursive_embedding:
+                    dg.nodes[node]["weights"] = [
+                        hash_smarts(prim_sm, prims, func="embedded")
+                    ]
             else:
                 dg.nodes[node]["weights"] = [
                     hash_smarts(prim_sm, prims, func="embedded")
@@ -1822,7 +1935,8 @@ def order_token_canon(
                 dg.nodes[node]["weights"] = these_weights
             elif op == ",":
                 these_weights = sorted(
-                    these_weights, key=cmp_to_key(custom_key2), reverse=True
+                    these_weights,
+                    key=lambda item: _or_branch_sort_key(item, prims),
                 )
                 dg.nodes[node]["weights"] = these_weights
 
@@ -1850,10 +1964,27 @@ def order_token_canon(
             dg.nodes[node]["text"] = op.join(this_text)
             weights_in_order.append(these_weights)
 
-    # print(dg.nodes)
+    # Prefer whole-atom-query embedding when available, e.g. [!#1&!#6].
+    # Fall back to default compositional weights otherwise.
+    final_weight = weights_in_order[-1] if len(weights_in_order) > 0 else []
+    token_unmapped = "[" + dg.nodes[0]["text"] + "]"
+    token_mapped = None
     if atom_map != None and len(atom_map) > 0:
-        return "[" + dg.nodes[0]["text"] + atom_map + "]", weights_in_order[-1], dg
-    return "[" + dg.nodes[0]["text"] + "]", weights_in_order[-1], dg
+        token_mapped = "[" + dg.nodes[0]["text"] + atom_map + "]"
+
+    if isinstance(prims, dict):
+        candidate_keys = [token_unmapped, token_unmapped[1:-1]]
+        if token_mapped is not None:
+            candidate_keys.extend([token_mapped, token_mapped[1:-1]])
+
+        for k in candidate_keys:
+            if k in prims:
+                final_weight = [hash_smarts(k, prims, func="embedded")]
+                break
+
+    if atom_map != None and len(atom_map) > 0:
+        return token_mapped, final_weight, dg
+    return token_unmapped, final_weight, dg
 
 
 # def generate(
